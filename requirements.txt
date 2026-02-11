@@ -1,0 +1,20 @@
+# ATLAS — MODE-1 Dependencies
+# Install with: pip install -r requirements.txt
+
+# Vision & hand tracking
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+
+# Machine learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Offline speech recognition
+vosk>=0.3.40
+sounddevice>=0.4.6
+
+# 2D visualization
+pygame>=2.5.0
+
+# Utilities
+numpy>=1.24.0
