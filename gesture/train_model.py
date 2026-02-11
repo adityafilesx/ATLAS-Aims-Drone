@@ -2,11 +2,11 @@
 train_model.py — CNN Training Pipeline
 ========================================
 Trains the GestureCNN on the custom dataset collected by collect_data.py.
-Includes data augmentation, loss tracking, and model saving.
+Includes moderate data augmentation, label smoothing, and model saving.
 
 Usage:
     python -m gesture.train_model
-    python -m gesture.train_model --epochs 15 --batch_size 64
+    python -m gesture.train_model --epochs 15 --batch_size 32
 
 Prerequisites:
     1. Run collect_data.py to build dataset/train/ and dataset/val/
@@ -35,21 +35,15 @@ IMAGE_SIZE = 128
 def get_transforms():
     """
     Create training and validation transforms.
-    Training includes data augmentation for robustness.
+    Training includes moderate data augmentation for robustness
+    without over-distorting grayscale hand crops.
     """
     train_transform = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        # ----- data augmentation -----
-        transforms.RandomRotation(15),
+        # ----- moderate augmentation -----
+        transforms.RandomRotation(10),
         transforms.RandomHorizontalFlip(p=0.3),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3),
-        transforms.RandomAffine(
-            degrees=0,
-            translate=(0.1, 0.1),
-            scale=(0.9, 1.1),
-        ),
-        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
         # ----- convert and normalize -----
         transforms.ToTensor(),          # [0, 255] → [0.0, 1.0]
         transforms.Normalize([0.5], [0.5]),  # center around 0
@@ -65,14 +59,14 @@ def get_transforms():
     return train_transform, val_transform
 
 
-def train(epochs=12, batch_size=32, learning_rate=0.001):
+def train(epochs=15, batch_size=32, learning_rate=0.0005):
     """
     Full training loop for the GestureCNN.
 
     Args:
-        epochs:        number of training epochs (default: 12)
+        epochs:        number of training epochs (default: 15)
         batch_size:    mini-batch size (default: 32)
-        learning_rate: Adam learning rate (default: 0.001)
+        learning_rate: Adam learning rate (default: 0.0005)
     """
     # ----- device -----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -109,12 +103,13 @@ def train(epochs=12, batch_size=32, learning_rate=0.001):
 
     # ----- model, loss, optimizer -----
     model = GestureCNN().to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     print(f"\n{'='*50}")
     print(f"  Training GestureCNN — {epochs} epochs")
     print(f"  Batch size: {batch_size} | LR: {learning_rate}")
+    print(f"  Label smoothing: 0.1")
     print(f"{'='*50}\n")
 
     best_val_acc = 0.0
@@ -191,12 +186,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train the ATLAS GestureCNN on collected hand images."
     )
-    parser.add_argument("--epochs", type=int, default=12,
-                        help="Number of training epochs (default: 12)")
+    parser.add_argument("--epochs", type=int, default=15,
+                        help="Number of training epochs (default: 15)")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Mini-batch size (default: 32)")
-    parser.add_argument("--lr", type=float, default=0.001,
-                        help="Learning rate for Adam (default: 0.001)")
+    parser.add_argument("--lr", type=float, default=0.0005,
+                        help="Learning rate for Adam (default: 0.0005)")
     args = parser.parse_args()
 
     train(epochs=args.epochs, batch_size=args.batch_size,

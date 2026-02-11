@@ -5,42 +5,32 @@ MODE-1: Human-in-the-Loop Interaction
 
 Two windows:
     1. Pygame — Isometric 3D drone simulator with telemetry HUD
-    2. OpenCV — Real-time hand gesture camera feed
+    2. OpenCV — Real-time hand gesture camera feed (via gesture_process)
 
 Usage:
     python3 main.py
-    python3 main.py --no-voice
     python3 main.py --no-gesture
     python3 main.py --no-gui
 """
 
-import sys, os, math, time, argparse, threading, multiprocessing, queue
+import sys, os, math, time, argparse, multiprocessing, queue
+
+# Ensure project root is on sys.path for local package imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ───── ATLAS modules ─────
 from drone.virtual_drone import VirtualDrone
 from motion.motion_controller import MotionController
-from emotion.emote_engine import EmoteEngine
+from motion.motion_commands import MotionCommand
 from core.mode_manager import ModeManager
-from voice.voice_listener import VoiceListener
 
 try:
-    from gesture.gesture_model import GesturePredictor
-    GESTURE_AVAILABLE = True
-except Exception:
-    GESTURE_AVAILABLE = False
-
-try:
-    import cv2, numpy as np
+    import cv2
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
 
 try:
-    from mediapipe.tasks.python import BaseOptions
-    from mediapipe.tasks.python.vision import (
-        HandLandmarker, HandLandmarkerOptions,
-        HandLandmarksConnections, RunningMode,
-    )
     import mediapipe as mp
     MEDIAPIPE_AVAILABLE = True
 except ImportError:
@@ -55,9 +45,7 @@ except ImportError:
 # ───── constants ─────
 WIN_W, WIN_H = 960, 720
 FPS = 30
-CONF_THRESH = 0.55
-IMAGE_SIZE = 128
-MARGIN = 30
+CONF_THRESH = 0.6
 
 
 # ══════════════════════════════════════════════════════════════
@@ -217,8 +205,8 @@ class DroneRenderer:
             self.screen.blit(self.fm.render(f"{lbl}:", True, (110, 115, 135)),
                              (16, y))
             vc = self.TXT
-            if "emergency" in val.lower(): vc = self.WARN
-            elif "emotion" in f['last_action']: vc = self.EMO
+            if "emergency" in val.lower():
+                vc = self.WARN
             self.screen.blit(self.fm.render(f" {val}", True, vc), (70, y))
             y += 20
 
@@ -278,176 +266,40 @@ class DroneRenderer:
 # ══════════════════════════════════════════════════════════════
 
 def handle_keys(mm):
-    from motion.motion_commands import MotionCommand
     for ev in pygame.event.get():
-        if ev.type == pygame.QUIT: return False
-        if ev.type != pygame.KEYDOWN: continue
+        if ev.type == pygame.QUIT:
+            return False
+        if ev.type != pygame.KEYDOWN:
+            continue
         k = ev.key
-        m = {pygame.K_w: MotionCommand.MOVE_FORWARD,
-             pygame.K_s: MotionCommand.MOVE_BACKWARD,
-             pygame.K_a: MotionCommand.MOVE_LEFT,
-             pygame.K_d: MotionCommand.MOVE_RIGHT,
-             pygame.K_UP: MotionCommand.MOVE_UP,
-             pygame.K_DOWN: MotionCommand.MOVE_DOWN,
-             pygame.K_q: MotionCommand.ROTATE,
-             pygame.K_SPACE: MotionCommand.HOVER,
-             pygame.K_f: MotionCommand.FLIP,
-             pygame.K_1: MotionCommand.SLOW_MODE,
-             pygame.K_2: MotionCommand.FAST_MODE,
-             pygame.K_x: MotionCommand.EMERGENCY_STOP}
+        m = {
+            pygame.K_w:     MotionCommand.MOVE_FORWARD,
+            pygame.K_s:     MotionCommand.MOVE_BACKWARD,
+            pygame.K_a:     MotionCommand.MOVE_LEFT,
+            pygame.K_d:     MotionCommand.MOVE_RIGHT,
+            pygame.K_UP:    MotionCommand.MOVE_UP,
+            pygame.K_DOWN:  MotionCommand.MOVE_DOWN,
+            pygame.K_q:     MotionCommand.ROTATE_LEFT,
+            pygame.K_e:     MotionCommand.ROTATE_RIGHT,
+            pygame.K_SPACE: MotionCommand.HOVER,
+            pygame.K_f:     MotionCommand.FLIP,
+            pygame.K_1:     MotionCommand.SLOW_MODE,
+            pygame.K_2:     MotionCommand.FAST_MODE,
+            pygame.K_3:     MotionCommand.NORMAL_MODE,
+            pygame.K_x:     MotionCommand.EMERGENCY_STOP,
+        }
         if k in m:
-            mm._execute_motion(m[k], source="keyboard")
-        elif k == pygame.K_e:
-            mm.drone.rotate(-45)
-        elif k == pygame.K_3:
-            mm.drone.speed_mode = "normal"
+            mm.handle_keyboard(m[k])
         elif k == pygame.K_r:
-            mm._reset_emergency(source="keyboard")
-        elif k == pygame.K_h:
-            mm._execute_emotion("happy", source="keyboard")
-        elif k == pygame.K_c:
-            mm._execute_emotion("calm", source="keyboard")
-        elif k == pygame.K_b:
-            mm._execute_emotion("excited", source="keyboard")
+            mm.reset_emergency()
         elif k == pygame.K_ESCAPE:
             return False
     return True
 
 
 # ══════════════════════════════════════════════════════════════
-#  GESTURE CAPTURE + LIVE WINDOW  (OpenCV process)
+#  GESTURE QUEUE POLLING
 # ══════════════════════════════════════════════════════════════
-
-def gesture_window_process(result_queue, stop_event, model_path):
-    """
-    Separate process that owns the webcam + OpenCV window.
-    Sends (label, confidence) back to the main process via a queue.
-    """
-    if not CV2_AVAILABLE:
-        print("[Gesture] OpenCV unavailable.")
-        return
-
-    from gesture.gesture_model import GesturePredictor
-    predictor = GesturePredictor(model_path=model_path)
-    if not predictor.loaded:
-        print("[Gesture] Model not loaded. Run 'python3 -m gesture.train_model'.")
-        return
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[Gesture] Cannot open webcam.")
-        return
-
-    # ---- set up MediaPipe hand landmarker ----
-    landmarker = None
-    if MEDIAPIPE_AVAILABLE:
-        mp_model_path = os.path.join(os.path.dirname(__file__),
-                                     "gesture", "hand_landmarker.task")
-        if os.path.exists(mp_model_path):
-            try:
-                opts = HandLandmarkerOptions(
-                    base_options=BaseOptions(model_asset_path=mp_model_path),
-                    running_mode=RunningMode.VIDEO,
-                    num_hands=1,
-                    min_hand_detection_confidence=0.5,
-                    min_hand_presence_confidence=0.5,
-                    min_tracking_confidence=0.5,
-                )
-                landmarker = HandLandmarker.create_from_options(opts)
-                print("[Gesture] ✅ MediaPipe hand landmarker loaded.")
-            except Exception as e:
-                print(f"[Gesture] MediaPipe init failed: {e}")
-        else:
-            print(f"[Gesture] hand_landmarker.task not found at {mp_model_path}")
-
-    import torch
-    print("[Gesture] 📷 Gesture window opened.")
-    ts = 0
-    label, conf = "none", 0.0
-    bbox = None
-
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        frame = cv2.flip(frame, 1)
-        h, w = frame.shape[:2]
-        hand_crop_gray = None
-        bbox = None
-
-        # ---- detect hand landmarks ----
-        if landmarker is not None:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            ts += 33
-            try:
-                res = landmarker.detect_for_video(mp_img, ts)
-            except Exception:
-                res = None
-
-            if res and res.hand_landmarks:
-                for hand_lms in res.hand_landmarks:
-                    xs = [lm.x * w for lm in hand_lms]
-                    ys = [lm.y * h for lm in hand_lms]
-                    x1 = max(0, int(min(xs)) - MARGIN)
-                    y1 = max(0, int(min(ys)) - MARGIN)
-                    x2 = min(w, int(max(xs)) + MARGIN)
-                    y2 = min(h, int(max(ys)) + MARGIN)
-                    bbox = (x1, y1, x2, y2)
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                        hand_crop_gray = cv2.resize(
-                            gray, (IMAGE_SIZE, IMAGE_SIZE)
-                        )
-                    break
-
-        # Fallback: center crop if no hand detected
-        if hand_crop_gray is None:
-            side = min(h, w)
-            y1 = (h - side) // 2
-            x1 = (w - side) // 2
-            crop = frame[y1:y1 + side, x1:x1 + side]
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            hand_crop_gray = cv2.resize(gray, (IMAGE_SIZE, IMAGE_SIZE))
-
-        # ---- CNN prediction ----
-        t = torch.from_numpy(hand_crop_gray).float() / 255.0
-        t = (t - 0.5) / 0.5
-        t = t.unsqueeze(0).unsqueeze(0)
-        label, conf = predictor.predict(t)
-
-        try:
-            result_queue.put_nowait((label, conf))
-        except queue.Full:
-            pass
-
-        # ---- draw overlay ----
-        display = frame.copy()
-        if bbox is not None:
-            x1, y1, x2, y2 = bbox
-            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        cv2.rectangle(display, (0, 0), (w, 60), (12, 14, 28), -1)
-        cv2.putText(display, "ATLAS Gesture Window", (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-        cv2.putText(display, f"Gesture: {label.upper()}  {conf:.0%}", (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 130), 2)
-
-        cv2.imshow("ATLAS Gesture Window", display)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            stop_event.set()
-            break
-
-        time.sleep(0.02)
-
-    cap.release()
-    if landmarker is not None:
-        landmarker.close()
-    cv2.destroyAllWindows()
-    print("[Gesture] Gesture window closed.")
-
 
 def poll_gesture_queue(result_queue, mm, renderer):
     """Drain the gesture queue and route predictions to the FSM + HUD."""
@@ -468,38 +320,30 @@ def poll_gesture_queue(result_queue, mm, renderer):
 
 
 # ══════════════════════════════════════════════════════════════
-#  VOICE
-# ══════════════════════════════════════════════════════════════
-
-def voice_loop(vl, mm, stop):
-    while not stop.is_set():
-        t = vl.get_command()
-        if t: mm.handle_voice(t)
-        time.sleep(0.05)
-
-
-# ══════════════════════════════════════════════════════════════
 #  TERMINAL MODE
 # ══════════════════════════════════════════════════════════════
 
-def terminal_mode(mm, vl, stop, result_queue=None):
+def terminal_mode(mm, stop, result_queue=None):
     print("\n" + "=" * 55)
     print("  ATLAS MODE-1 — Terminal Mode")
-    print("  Type: 'atlas go up', 'atlas be happy', 'status', 'quit'")
+    print("  Type: 'status', 'quit'")
     print("=" * 55 + "\n")
     while not stop.is_set():
         try:
             cmd = input("ATLAS> ").strip()
-            if not cmd: continue
+            if not cmd:
+                continue
             if cmd.lower() in ("quit", "exit", "q"):
-                stop.set(); break
+                stop.set()
+                break
             if cmd.lower() == "status":
-                print(f"  {mm.drone}"); continue
-            mm.handle_voice(cmd)
+                print(f"  {mm.drone}")
+                continue
             poll_gesture_queue(result_queue, mm, None)
             print(f"  {mm.drone}")
         except (EOFError, KeyboardInterrupt):
-            stop.set(); break
+            stop.set()
+            break
 
 
 # ══════════════════════════════════════════════════════════════
@@ -508,7 +352,6 @@ def terminal_mode(mm, vl, stop, result_queue=None):
 
 def main():
     ap = argparse.ArgumentParser(description="ATLAS Drone Simulator")
-    ap.add_argument("--no-voice",   action="store_true")
     ap.add_argument("--no-gesture", action="store_true")
     ap.add_argument("--no-gui",     action="store_true")
     args = ap.parse_args()
@@ -520,47 +363,47 @@ def main():
 
     drone = VirtualDrone()
     mm = ModeManager(drone=drone,
-                     motion_controller=MotionController(drone),
-                     emote_engine=EmoteEngine(drone))
+                     motion_controller=MotionController(drone))
     stop = multiprocessing.Event()
-
-    # voice
-    vl = None
-    if not args.no_voice:
-        vl = VoiceListener(); vl.start()
-        threading.Thread(target=voice_loop, args=(vl, mm, stop),
-                         daemon=True).start()
 
     # renderer
     renderer = None
     if not args.no_gui and PYGAME_AVAILABLE:
         renderer = DroneRenderer()
 
-    # gesture + window (separate process)
+    # gesture + window (separate process using gesture_process.run)
     gesture_queue = None
     gesture_proc = None
-    if not args.no_gesture and GESTURE_AVAILABLE and CV2_AVAILABLE:
-        model_path = GesturePredictor.DEFAULT_MODEL_PATH
-        if os.path.exists(model_path):
-            gesture_queue = multiprocessing.Queue(maxsize=5)
+    if not args.no_gesture and CV2_AVAILABLE and MEDIAPIPE_AVAILABLE:
+        try:
+            from gesture.gesture_process import run as gesture_run
+            gesture_queue = multiprocessing.Queue(maxsize=1)
             gesture_proc = multiprocessing.Process(
-                target=gesture_window_process,
-                args=(gesture_queue, stop, model_path),
+                target=gesture_run,
+                args=(gesture_queue, stop),
                 daemon=True,
             )
             gesture_proc.start()
-        else:
-            print("[main] Model not loaded. Run 'python3 -m gesture.train_model'.")
+            print("[main] 📷 Gesture process started.")
+        except ImportError as e:
+            print(f"[main] Gesture process import failed: {e}")
     elif not args.no_gesture:
-        print("[main] Gesture unavailable (missing cv2/torch).")
+        missing = []
+        if not CV2_AVAILABLE:
+            missing.append("cv2")
+        if not MEDIAPIPE_AVAILABLE:
+            missing.append("mediapipe")
+        print(f"[main] Gesture unavailable (missing: {', '.join(missing)}).")
 
     # main loop
     if args.no_gui or not PYGAME_AVAILABLE:
-        terminal_mode(mm, vl, stop, gesture_queue)
+        terminal_mode(mm, stop, gesture_queue)
     else:
         print("[main] 🎮 Pygame window opened. Gesture capture running.")
         print("[main] Press ESC or close window to quit.\n")
         while not stop.is_set():
+            # Apply velocity each frame
+            drone.tick()
             poll_gesture_queue(gesture_queue, mm, renderer)
             if not handle_keys(mm):
                 break
@@ -570,7 +413,6 @@ def main():
     stop.set()
     if gesture_proc:
         gesture_proc.join(timeout=2)
-    if vl: vl.stop()
     print("\n[ATLAS] Shutdown complete. Goodbye! 🚁\n")
 
 

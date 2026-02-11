@@ -1,131 +1,100 @@
-# ATLAS — Autonomous Terrain-Learning and Analysis System (Mode-1)
+# ATLAS v1 — Motion-Only Gesture-Controlled Drone
 
-**Status:** Mode-1 (Human-in-the-Loop) implemented. Mode-2 (Machine-in-the-Loop) is planned but not yet functional.
+A clean, minimal drone control system using hand-gesture recognition.
 
-ATLAS explores safe, explainable human–robot interaction. The core principle: *an intelligent system must know when to act — and when to stop.*
+## Architecture
 
----
-
-## Modes
-
-- **Mode-1: Human-in-the-Loop** (implemented)
-  - Voice (primary authority)
-  - Hand gestures (secondary)
-  - Emergency stop overrides everything
-  - Emotions are non-navigational and cancelable
-- **Mode-2: Machine-in-the-Loop** (planned)
-  - Autonomous terrain analysis and energy-aware path planning (A*, risk/uncertainty/energy cost)
-  - Strict separation from human control
-
----
-
-## Architecture (Mode-1)
-
-Sensors (mic, webcam) → Perception (ASR, Gesture CNN) → Mode Manager (FSM) → Motion/Emotion Controllers → Virtual Drone (Pygame sim) → Logging/HUD
-
-**Principles**
-1. Perception ≠ Decision ≠ Control
-2. Strict mode separation
-3. Uncertainty is a signal
-4. Self-preservation over aggression
-5. Energy is a strategic resource (planned for Mode-2)
-
----
-
-## Features (Mode-1)
-
-- **Voice commands (primary):** “ATLAS go up”, “rotate”, “hover”, “be happy”, “emergency stop”
-- **Hand gestures (secondary):** up/down/left/right/forward/backward/rotate/flip/open_palm/fist/thumb_up/two_fingers/five_fingers
-- **Motion commands:** move_* , rotate, flip, hover, slow_mode, fast_mode, emergency_stop
-- **Emotions (non-navigational):** happy, excited, curious, bored, sad, calm, alert, tired, confident, confused
-- **Safety:** Emergency stop trumps all; gestures ignored when stopped; voice can reset
-- **Stability improvements:** Gesture smoothing (window/majority), per-command cooldowns, non-blocking timed emotions, centralized guards, basic logging
-
----
-
-## Requirements
-
-See `requirements.txt`. Key deps:
-- Python 3.9+ recommended
-- OpenCV, MediaPipe (hand tracking), PyTorch (gesture CNN), pygame (sim), vosk/sounddevice (offline ASR), numpy
-
-Install:
-```bash
-python -m venv .venv
-source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-pip install -r requirements.txt
+```
+┌──────────────────────────┐     Queue(1)     ┌─────────────────────────┐
+│    Perception Process    │ ──────────────→  │      Main Process       │
+│  (gesture_process.py)    │  (label, conf)   │       (main.py)         │
+│                          │                  │                         │
+│  Webcam → MediaPipe      │                  │  ModeManager (2-state)  │
+│  → 42D features          │                  │  → MotionController     │
+│  → MLP (42→64→32→7)      │                  │  → VirtualDrone         │
+│  → EMA smooth            │                  │  → Pygame renderer      │
+│  → send-on-change        │                  │                         │
+└──────────────────────────┘                  └─────────────────────────┘
 ```
 
----
+## 7 Gesture Classes
 
-## Running
+| Gesture        | Drone Action      |
+|:---------------|:------------------|
+| `MOVE_UP`      | Gain altitude     |
+| `MOVE_DOWN`    | Lose altitude     |
+| `MOVE_LEFT`    | Strafe left       |
+| `MOVE_RIGHT`   | Strafe right      |
+| `MOVE_FORWARD` | Move forward      |
+| `MOVE_BACKWARD`| Move backward     |
+| `HOVER`        | Stop (zero vel)   |
 
-### Pygame sim + gestures + voice
+## Project Structure
+
+```
+ATLAS-Aims-drone/
+├── config.py                  # Central constants
+├── main.py                    # Pygame renderer + main loop
+├── drone/
+│   └── virtual_drone.py       # Velocity-based drone model
+├── motion/
+│   ├── motion_commands.py     # 7 MotionCommand enum
+│   └── motion_controller.py   # Command → drone dispatch
+├── core/
+│   └── mode_manager.py        # 2-state FSM (IDLE / MOVING)
+├── gesture/
+│   ├── gesture_process.py     # Perception process (camera + MLP)
+│   ├── feature_engineering.py # Landmark → 42D vector
+│   ├── mlp_model.py           # GestureMLP + GestureClassifier
+│   ├── train_mlp.py           # Training script
+│   ├── gesture_labels.py      # Label utilities
+│   └── hand_landmarker.task   # MediaPipe model file
+├── models/
+│   └── gesture_mlp.pth        # Trained MLP weights
+└── dataset/
+    └── landmarks_train.npy    # Training data (after collection)
+```
+
+## Quick Start
+
 ```bash
+# Run with gesture control
 python main.py
+
+# Keyboard only
+python main.py --no-gesture
 ```
 
-### Disable components
+### Keyboard Controls
+- **WASD** — move (forward/back/left/right)
+- **↑ / ↓** — altitude up/down
+- **SPACE** — hover (stop)
+- **ESC** — quit
+
+## Design Decisions
+
+### Why MLP over CNN?
+The CNN required full hand-crop images (128×128 grayscale), which were sensitive to cropping quality, lighting, and hand orientation. The MLP takes **21 landmark coordinates** directly from MediaPipe — already normalised, rotation-invariant, and lighting-independent. The 42D feature vector (wrist-relative, span-normalised) makes the model fast, stable, and easy to train with small datasets.
+
+### Why Velocity-Based?
+The previous system used discrete step commands — each gesture triggered a single position update. The new model sets a **velocity vector** that persists until overridden. This creates smooth, continuous motion that naturally maps to "hold gesture = keep moving, release = stop."
+
+### Why Send-on-Change Queue?
+The old system spammed the queue every frame, flooding it with redundant `NO_GESTURE` messages. The new system only sends when:
+1. The gesture **changes** to a different class
+2. Confidence is **≥ threshold** (0.6)
+3. Hand disappears → **single** `HOVER` event
+
+This eliminates queue spam and makes the system deterministic.
+
+### Axis Mirroring Resolution
+The webcam frame is flipped horizontally (`cv2.flip(frame, 1)`) so the user sees a mirror view. The landmark coordinates are already in the flipped frame, so **no additional axis inversion** is needed. `MOVE_LEFT` in the camera corresponds to `MOVE_LEFT` on screen.
+
+## Training the MLP
+
+1. Collect landmark data (store as `.npy` files in `dataset/`)
+2. Train:
 ```bash
-python main.py --no-voice       # no microphone/ASR
-python main.py --no-gesture     # no webcam/gesture
-python main.py --no-gui         # terminal mode only
+python -m gesture.train_mlp --epochs 30 --lr 0.001
 ```
-
----
-
-## Controls (Mode-1)
-
-- **Voice (examples):** “ATLAS go up”, “ATLAS rotate”, “ATLAS hover”, “ATLAS be happy”, “ATLAS emergency stop”
-- **Keyboard (Pygame window):**
-  - Movement: W/A/S/D, ↑/↓, Q (rotate), SPACE (hover), F (flip)
-  - Speed: 1=slow, 2=fast, 3=normal
-  - Safety: X (emergency stop), R (reset emergency)
-  - Exit: ESC
-- **Gestures:** Mapped to motion/emotion via the Gesture CNN (confidence threshold + smoothing)
-
----
-
-## Project Structure (key files)
-
-- `main.py` — entry point; spawns voice thread, gesture process, Pygame renderer; smoothing/cooldowns in main loop
-- `core/mode_manager.py` — FSM; enforces emergency stop, cooldowns, non-blocking emotions, state/status
-- `motion/` — motion commands and controller
-- `gesture/` — gesture model, MediaPipe hand landmarking, CNN inference
-- `voice/` — offline ASR listener and intent mapping
-- `emotion/` — emotion mapping and non-blocking emote engine
-- `drone/` — virtual drone model for simulation
-
----
-
-## Recent improvements (Mode-1)
-
-- Gesture smoothing (windowed confidence-weighted majority) and freshness drop
-- Per-command cooldowns (debounce gesture/voice spam)
-- Non-blocking, time-bounded emotions with periodic tick
-- Centralized emergency and guards in ModeManager
-- Basic logging with reduced dependency noise
-- Removed arbitrary sleeps in gesture loop for better responsiveness
-
----
-
-## Known limitations
-
-- Mode-2 autonomy/path-planning is not implemented yet.
-- Uses a single webcam/microphone; no multi-sensor fusion.
-- Offline ASR quality depends on the installed model and mic setup.
-- Gesture model quality depends on provided training data.
-
----
-
-## Roadmap (planned)
-
-- Implement Mode-2: terrain CNN, uncertainty/risk analysis, energy-aware A* planner
-- Expand explainability/logging for decisions and safety triggers
-- Add tests for ModeManager, motion/emotion handlers, and smoothing logic
-
----
-
-## License
-
-MIT (if not specified otherwise). Check repository license file if added.
+3. Weights saved to `models/gesture_mlp.pth`
